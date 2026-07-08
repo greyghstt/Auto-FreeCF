@@ -2,95 +2,234 @@
 Turnstile Bypass — Multi-strategy solver for Cloudflare Turnstile.
 
 Strategies (tried in order):
-1. verify_cf() — nodriver built-in (image template matching)
-2. CDP-based token check — check cf_challenge_response value directly
-3. Quick interaction — mouse move, tab, click around widget (triggers partial token)
-4. Wait for manual solve via visible browser window
-5. Fallback — just return, let submit-first logic handle it
+1. Check if token already populated (e.g. after manual solve or passive solve)
+2. verify_cf() — nodriver built-in (image template matching → mouse click)
+   Then poll for cf_challenge_response token to appear (verify_cf returns None)
+3. CDP Input.dispatchMouseEvent — real mouse movement around widget (not JS-dispatched)
+4. Wait for token to appear after interaction (poll up to 30s)
+5. Fallback — return empty string, let submit-first logic handle it
 
-The insight: CF signup flow is lenient. A partial/interacted Turnstile
-often passes. Only fall back to full solve if redirect fails.
+Key findings from nodriver source code research:
+- verify_cf() only does template_location() → mouse_click(). Returns None, NOT a token.
+- page.evaluate() without return_by_value=True returns RemoteObject, not a plain value.
+  Must use return_by_value=True and handle the RemoteObject wrapper.
+- 'iframe_present' must NEVER be returned as a token (14 chars > 10 = false positive).
 """
 
 import asyncio
 from typing import Optional
 
+import nodriver as uc
+from nodriver import cdp
 
-async def verify_cf(page, timeout: float = 60.0) -> str:
-    """Solve Turnstile using nodriver's built-in method."""
-    result = await page.verify_cf()
-    return result or ""
+
+def _unwrap(val):
+    """Unwrap nodriver evaluate result to primitive value.
+
+    nodriver evaluate() can return:
+    - RemoteObject (when return_by_value=False) → has .value attribute
+    - deep_serialized_value → has .value attribute
+    - plain value (when return_by_value=True and value is truthy)
+    - ExceptionDetails (when JS throws)
+    - None
+    """
+    if val is None:
+        return None
+    # ExceptionDetails — return None, caller handles
+    if isinstance(val, cdp.runtime.ExceptionDetails):
+        return None
+    # RemoteObject namedtuple — has .value
+    if hasattr(val, "value") and not isinstance(val, (dict, list, str, int, float, bool)):
+        return val.value
+    # DeepSerializedValue — has .value
+    if hasattr(val, "deep_serialized_value") and val.deep_serialized_value:
+        return val.deep_serialized_value.value
+    # Already unwrapped dict/list/primitive
+    if isinstance(val, dict) and "value" in val:
+        return val["value"]
+    return val
 
 
 async def _get_challenge_token(page) -> str:
-    """Read the actual cf_challenge_response / cf-turnstile-response token value."""
-    val = await page.evaluate("""
+    """Read the actual cf_challenge_response / cf-turnstile-response token value.
+
+    Returns:
+        Token string if populated, empty string otherwise.
+        NEVER returns 'iframe_present' — that's not a token.
+    """
+    val = await page.evaluate(
+        """
         (() => {
             // Check both possible field names
             const el = document.querySelector('input[name="cf_challenge_response"]');
             if (el && el.value && el.value.length > 10) return el.value;
             const el2 = document.querySelector('input[name="cf-turnstile-response"]');
             if (el2 && el2.value && el2.value.length > 10) return el2.value;
-            // Check inside Turnstile iframe
-            const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-            if (iframe) return 'iframe_present';
             return '';
         })()
-    """)
-    if isinstance(val, dict) and "value" in val:
-        return val["value"] or ""
-    return str(val or "")
+        """,
+        return_by_value=True,
+    )
+    result = _unwrap(val)
+    if result is None:
+        return ""
+    s = str(result).strip()
+    # Reject 'iframe_present' and other non-token strings
+    if s == "iframe_present" or len(s) < 10:
+        return ""
+    return s
+
+
+async def _verify_cf_and_poll(page, timeout: float = 30.0) -> str:
+    """
+    Call nodriver's verify_cf() (template matching + mouse click on checkbox),
+    then poll for the cf_challenge_response token to appear.
+
+    verify_cf() returns None — it only clicks. The token appears asynchronously
+    after Cloudflare processes the click. We must poll.
+    """
+    try:
+        # verify_cf does: template_location → mouse_click
+        # It returns None, so we don't capture the return value
+        await page.verify_cf()
+    except Exception as e:
+        print(f"    ⚠️ verify_cf() error: {e}")
+
+    # Poll for token to appear after the click
+    token = await _wait_for_token(page, timeout=timeout, poll=1.0)
+    return token
 
 
 async def quick_interact(page) -> bool:
     """
-    Minimal interaction to trigger Turnstile partial token.
-    Moves mouse around the widget, tabs, clicks nearby.
-    Returns True if any interaction succeeded.
+    Real mouse interaction via CDP Input.dispatchMouseEvent to trigger
+    Turnstile partial token. Uses actual CDP mouse events (not JS-dispatched)
+    to avoid detection.
+
+    Returns True if a token was found after interaction.
     """
     try:
         # Scroll widget into view
-        await page.evaluate("""
+        await page.evaluate(
+            """
             const w = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
             if (w) w.scrollIntoView({block: 'center'});
-        """)
+            """,
+            return_by_value=True,
+        )
         await asyncio.sleep(1)
 
-        # Click near the Turnstile iframe (not on it — triggers detection)
-        viewport = await page.evaluate("""
-            (()=>{return {w:window.innerWidth, h:window.innerHeight}})()
-        """)
+        # Get viewport dimensions
+        viewport = _unwrap(
+            await page.evaluate(
+                "(() => ({w: window.innerWidth, h: window.innerHeight}))()",
+                return_by_value=True,
+            )
+        )
+        if not isinstance(viewport, dict):
+            viewport = {"w": 800, "h": 600}
         w, h = viewport.get("w", 800), viewport.get("h", 600)
 
-        # Move mouse across center of page (where Turnstile usually sits)
+        # Real CDP mouse movement across center of page (where Turnstile sits)
+        # Input.dispatchMouseEvent is the proper CDP way — not JS dispatchEvent
+        center_y = int(h * 0.5)
         for x in range(int(w * 0.3), int(w * 0.7), 40):
-            await page.evaluate(f"document.elementFromPoint({x},{int(h*0.5)})?.dispatchEvent(new MouseEvent('mousemove',{{clientX:{x},clientY:{int(h*0.5)},bubbles:true}}))")
+            await page.send(
+                cdp.input_.dispatch_mouse_event(
+                    type_="mouseMoved",
+                    x=x,
+                    y=center_y,
+                )
+            )
             await asyncio.sleep(0.05)
 
-        # Click the checkbox area if present
-        clicked = await page.evaluate("""
-            (() => {
-                const cb = document.querySelector('.cb-i, .challenge, input[type="checkbox"]');
-                if (cb) { cb.click(); return true; }
-                return false;
-            })()
-        """)
+        # Click near the Turnstile checkbox area
+        # Try to find the iframe bounding box and click its center
+        box = _unwrap(
+            await page.evaluate(
+                """
+                (() => {
+                    const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+                    if (iframe) {
+                        const r = iframe.getBoundingClientRect();
+                        return JSON.stringify({x: r.x + r.width/2, y: r.y + r.height/2});
+                    }
+                    return null;
+                })()
+                """,
+                return_by_value=True,
+            )
+        )
+        if isinstance(box, str):
+            try:
+                import json
+
+                coords = json.loads(box)
+                cx, cy = int(coords["x"]), int(coords["y"])
+                await page.send(
+                    cdp.input_.dispatch_mouse_event(
+                        type_="mousePressed",
+                        x=cx,
+                        y=cy,
+                        button=cdp.input_.MouseButton.LEFT,
+                        click_count=1,
+                    )
+                )
+                await asyncio.sleep(0.1)
+                await page.send(
+                    cdp.input_.dispatch_mouse_event(
+                        type_="mouseReleased",
+                        x=cx,
+                        y=cy,
+                        button=cdp.input_.MouseButton.LEFT,
+                        click_count=1,
+                    )
+                )
+                print(f"    🖱️ Clicked Turnstile at ({cx},{cy})")
+            except Exception as e:
+                print(f"    ⚠️ Click failed: {e}")
+        else:
+            # Fallback: click center of page
+            cx, cy = int(w * 0.5), center_y
+            await page.send(
+                cdp.input_.dispatch_mouse_event(
+                    type_="mousePressed",
+                    x=cx,
+                    y=cy,
+                    button=cdp.input_.MouseButton.LEFT,
+                    click_count=1,
+                )
+            )
+            await asyncio.sleep(0.1)
+            await page.send(
+                cdp.input_.dispatch_mouse_event(
+                    type_="mouseReleased",
+                    x=cx,
+                    y=cy,
+                    button=cdp.input_.MouseButton.LEFT,
+                    click_count=1,
+                )
+            )
+
         await asyncio.sleep(2)
 
         # Check if we got a token after interaction
         token = await _get_challenge_token(page)
-        if token and len(token) > 10:
-            print(f"    ✅ Turnstile token found after interaction: {token[:20]}...")
+        if token:
+            print(f"    ✅ Turnstile token found after CDP interaction: {token[:20]}...")
             return True
 
-        return True
-    except Exception:
+        return False
+    except Exception as e:
+        print(f"    ⚠️ quick_interact error: {e}")
         return False
 
 
 async def is_turnstile_present(page) -> bool:
     """Check if Turnstile CAPTCHA is present on page."""
-    present = await page.evaluate('''(() => {
+    present = _unwrap(
+        await page.evaluate(
+            """(() => {
         if (document.querySelector('input[name="cf_challenge_response"]')) return true;
         if (document.querySelector('input[name="cf-turnstile-response"]')) return true;
         const iframes = document.querySelectorAll("iframe");
@@ -100,9 +239,10 @@ async def is_turnstile_present(page) -> bool:
         const body = document.body ? document.body.innerText : '';
         if (body.includes("Verify you are human") || body.includes("Let us know you are human")) return true;
         return false;
-    })()''')
-    if isinstance(present, dict) and "value" in present:
-        return bool(present["value"])
+    })()""",
+            return_by_value=True,
+        )
+    )
     return bool(present)
 
 
@@ -131,42 +271,31 @@ async def solve_turnstile(page, quick: bool = False) -> str:
     """
     timeout = 15.0 if quick else 60.0
 
-    # Strategy 1: Check if token already populated (e.g. after manual solve)
+    # Strategy 1: Check if token already populated (passive solve or manual)
     existing_token = await _get_challenge_token(page)
-    if existing_token and len(existing_token) > 10:
+    if existing_token:
         return existing_token
 
-    # Strategy 2: verify_cf() — nodriver built-in
-    try:
-        token = await verify_cf(page, timeout=timeout)
-        if token:
-            return token
-    except Exception:
-        pass
+    # Strategy 2: verify_cf() — nodriver built-in template matching + click
+    # Then poll for token (verify_cf returns None, token appears async)
+    token = await _verify_cf_and_poll(page, timeout=timeout)
+    if token:
+        return token
 
-    # Quick mode: just do quick interaction and return
+    # Quick mode: do CDP interaction, check once, return
     if quick:
         await quick_interact(page)
-        # Check again after interaction
         token = await _get_challenge_token(page)
-        if token and len(token) > 10:
+        if token:
             return token
         return ""  # Don't block — let submit-first handle it
 
-    # Strategy 3: Full solve with longer timeout
-    try:
-        token = await verify_cf(page, timeout=60.0)
-        if token:
-            return token
-    except Exception:
-        pass
-
-    # Strategy 4: Check token again (nodriver's verify_cf may have populated it)
-    token = await _get_challenge_token(page)
-    if token and len(token) > 10:
+    # Strategy 3: Full verify_cf with longer timeout
+    token = await _verify_cf_and_poll(page, timeout=30.0)
+    if token:
         return token
 
-    # Strategy 5: Interaction + wait for token
+    # Strategy 4: CDP interaction + wait for token
     await quick_interact(page)
     await asyncio.sleep(3)
 
@@ -176,3 +305,12 @@ async def solve_turnstile(page, quick: bool = False) -> str:
         return token
 
     return ""
+
+
+__all__ = [
+    "solve_turnstile",
+    "is_turnstile_present",
+    "quick_interact",
+    "_get_challenge_token",
+    "_wait_for_token",
+]

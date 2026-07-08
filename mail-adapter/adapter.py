@@ -278,7 +278,7 @@ class AdapterHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         body = self._read_body()
 
-        if path == "/api/new_address":
+        if path == "/api/new_address" or path == "/new_address":
             domain = body.get("domain", "gmilio.web.id")
             try:
                 data = supabase_create(domain)

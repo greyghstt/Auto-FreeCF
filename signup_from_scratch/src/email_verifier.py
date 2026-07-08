@@ -6,11 +6,12 @@ import asyncio
 import html
 import re
 import time
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import unquote
 
 import nodriver as uc
 
+from .turnstile_bypass import _unwrap
 from .email_generator import EmailGenerator
 
 
@@ -23,11 +24,11 @@ class EmailVerifyResult:
 
 CF_VERIFY_PATTERNS = [
     # Common Cloudflare dashboard/email verification links.
-    r'https://dash\.cloudflare\.com/[^\"><\s]+',
-    r'https://www\.cloudflare\.com/[^\"><\s]+',
-    r'https://cloudflare\.com/[^\"><\s]+',
+    r'https://dash\.cloudflare\.com/[^\"<>\s]+',
+    r'https://www\.cloudflare\.com/[^\"<>\s]+',
+    r'https://cloudflare\.com/[^\"<>\s]+',
     # Worker URL pattern for email verification
-    r'https://[a-z0-9-]+\.workers\.dev/[^\"><\s]+',
+    r'https://[a-z0-9-]+\.workers\.dev/[^\"<>\s]+',
 ]
 
 
@@ -81,13 +82,31 @@ async def verify_cloudflare_email(
     jwt: str,
     timeout: int = 120,
     poll_interval: int = 5,
+    email_gen: Optional[EmailGenerator] = None,
 ) -> EmailVerifyResult:
-    """Poll temp inbox, open Cloudflare verification link in the same browser session."""
+    """
+    Poll temp inbox, open Cloudflare verification link in the same browser session.
+
+    Args:
+        page: nodriver Tab (same browser session as signup)
+        mail_api: Mail API URL (used only if email_gen is None)
+        jwt: JWT token from email creation (may be 'owner_token::address' format)
+        timeout: Total polling timeout in seconds
+        poll_interval: Base polling interval (adaptive intervals override this)
+        email_gen: Pre-existing EmailGenerator with _active_url already set
+                    from email creation. If None, creates a new one (loses context).
+    """
     if not jwt:
         return EmailVerifyResult(False, error="missing_mail_jwt")
 
     print("  [verify] Waiting for Cloudflare verification email...")
-    gen = EmailGenerator(mail_api, [])
+
+    # Reuse the EmailGenerator from creation to preserve _active_url
+    # (the URL that actually created the email). Creating a new one loses
+    # this context and may hit a different relay that doesn't know this JWT.
+    gen = email_gen
+    if gen is None:
+        gen = EmailGenerator(mail_api, [])
     start = time.time()
 
     # Adaptive polling: start fast, slow down over time
@@ -96,9 +115,8 @@ async def verify_cloudflare_email(
     try:
         poll_idx = 0
         while time.time() - start < timeout:
-            # Adaptive: check less frequently over time
             current_interval = intervals[min(poll_idx, len(intervals) - 1)]
-            
+
             try:
                 mails = gen.check_inbox(jwt, limit=20, offset=0)
             except Exception as e:
@@ -129,22 +147,24 @@ async def verify_cloudflare_email(
                 await page.get(link)
                 await asyncio.sleep(15)
 
-                body_raw = await page.evaluate(
-                    "document.body ? document.body.innerText : ''",
-                    return_by_value=True,
+                body_raw = _unwrap(
+                    await page.evaluate(
+                        "document.body ? document.body.innerText : ''",
+                        return_by_value=True,
+                    )
                 )
                 body = str(body_raw).lower()
-                url = str(await page.evaluate("location.href", return_by_value=True)).lower()
+                url = str(
+                    _unwrap(await page.evaluate("location.href", return_by_value=True))
+                ).lower()
 
                 if any(k in body for k in ("verified", "success", "email has been verified", "already verified")):
                     return EmailVerifyResult(True, link=link)
                 if "dash.cloudflare.com" in url and "login" not in url:
-                    # Cloudflare often redirects to dashboard after successful verification.
                     return EmailVerifyResult(True, link=link)
 
                 if "expired" in body or "invalid" in body:
                     print("  [verify] Link expired, will retry polling for a fresher email...")
-                    # Don't return failure immediately — keep polling for another email
                     continue
 
                 # Assume success if link opened without error
@@ -155,7 +175,9 @@ async def verify_cloudflare_email(
 
         return EmailVerifyResult(False, error=f"verification_email_not_found_after_{timeout}s")
     finally:
-        gen.close()
+        # Only close if we created it (don't close caller's generator)
+        if email_gen is None:
+            gen.close()
 
 
 __all__ = ["EmailVerifyResult", "verify_cloudflare_email", "extract_verification_link"]

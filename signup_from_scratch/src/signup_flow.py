@@ -19,16 +19,9 @@ from typing import Optional
 
 import nodriver as uc
 
-from .turnstile_bypass import solve_turnstile, is_turnstile_present
+from .turnstile_bypass import solve_turnstile, is_turnstile_present, _unwrap
 
 CLOUDFLARE_SIGNUP_URL = "https://dash.cloudflare.com/sign-up"
-
-
-def _unwrap(val):
-    """Unwrap nodriver evaluate result dict to primitive value."""
-    if isinstance(val, dict) and "value" in val:
-        return val["value"]
-    return val
 
 
 class SignupResult:
@@ -95,16 +88,15 @@ async def _fill_form(page: uc.Tab, email: str, password: str) -> Optional[str]:
 
 async def _scroll_turnstile_into_view(page: uc.Tab) -> None:
     """Smart scroll: find Turnstile iframe and scroll it into center viewport."""
-    await page.evaluate("""
+    await page.evaluate(
+        """
         (() => {
             const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
             if (iframe) {
                 iframe.scrollIntoView({behavior: 'instant', block: 'center'});
-                // Also scroll down a bit to show the Sign Up button too
                 window.scrollBy(0, 150);
                 return true;
             }
-            // Fallback: try cf_challenge_response input
             const input = document.querySelector('input[name="cf-turnstile-response"], input[name="cf_challenge_response"]');
             if (input) {
                 input.scrollIntoView({behavior: 'instant', block: 'center'});
@@ -112,7 +104,9 @@ async def _scroll_turnstile_into_view(page: uc.Tab) -> None:
             }
             return false;
         })()
-    """)
+        """,
+        return_by_value=True,
+    )
     await asyncio.sleep(1)
 
 
@@ -131,16 +125,10 @@ async def _try_solve_turnstile(page: uc.Tab, quick: bool = False) -> str:
 
 async def _has_challenge_response(page: uc.Tab) -> bool:
     """Check if cf_challenge_response has a value."""
-    val = _unwrap(await page.evaluate("""
-        (() => {
-            const el = document.querySelector('input[name="cf_challenge_response"]');
-            if (el && el.value && el.value.length > 5) return el.value;
-            const el2 = document.querySelector('input[name="cf-turnstile-response"]');
-            if (el2 && el2.value && el2.value.length > 5) return el2.value;
-            return '';
-        })()
-    """))
-    return bool(val and len(str(val)) > 5)
+    from .turnstile_bypass import _get_challenge_token
+
+    token = await _get_challenge_token(page)
+    return bool(token and len(token) > 5)
 
 
 async def _wait_for_manual_captcha(
@@ -190,10 +178,10 @@ async def _wait_for_redirect(page: uc.Tab, max_wait: int = 30) -> str:
     """Wait for signup redirect. Returns final URL."""
     for _ in range(max_wait):
         await asyncio.sleep(1)
-        url = str(_unwrap(await page.evaluate("location.href")))
+        url = str(_unwrap(await page.evaluate("location.href", return_by_value=True)))
         if "/sign-up" not in url:
             return url
-    return str(_unwrap(await page.evaluate("location.href")))
+    return str(_unwrap(await page.evaluate("location.href", return_by_value=True)))
 
 
 async def _extract_account_id(page: uc.Tab, url: str) -> Optional[str]:
@@ -204,29 +192,39 @@ async def _extract_account_id(page: uc.Tab, url: str) -> Optional[str]:
         return match.group(1)
 
     # Try DOM
-    account_id = _unwrap(await page.evaluate("""
-        (() => {
-            const el = document.querySelector('[data-account-id], [data-testid="account-id"]');
-            if (el) return el.textContent || el.getAttribute('data-account-id');
-            return null;
-        })()
-    """))
+    account_id = _unwrap(
+        await page.evaluate(
+            """
+            (() => {
+                const el = document.querySelector('[data-account-id], [data-testid="account-id"]');
+                if (el) return el.textContent || el.getAttribute('data-account-id');
+                return null;
+            })()
+            """,
+            return_by_value=True,
+        )
+    )
     if account_id:
-        return account_id.strip()
+        return str(account_id).strip()
 
     return None
 
 
 async def _check_errors(page: uc.Tab) -> str:
     """Extract error messages from page."""
-    error_msgs = _unwrap(await page.evaluate("""
-        Array.from(document.querySelectorAll('p, [role="alert"], .error, .notification'))
-            .map(e => (e.textContent || '').trim())
-            .filter(t => t.length > 5 && (t.includes('unable') || t.includes('limit') ||
-                t.includes('Incorrect') || t.includes('try again') || t.includes('blocked')))
-    """))
+    error_msgs = _unwrap(
+        await page.evaluate(
+            """
+            Array.from(document.querySelectorAll('p, [role="alert"], .error, .notification'))
+                .map(e => (e.textContent || '').trim())
+                .filter(t => t.length > 5 && (t.includes('unable') || t.includes('limit') ||
+                    t.includes('Incorrect') || t.includes('try again') || t.includes('blocked')))
+            """,
+            return_by_value=True,
+        )
+    )
     if error_msgs and isinstance(error_msgs, list):
-        return "; ".join([str(_unwrap(m)) for m in error_msgs])
+        return "; ".join([str(m) for m in error_msgs if m])
     return ""
 
 

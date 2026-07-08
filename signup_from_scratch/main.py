@@ -149,14 +149,16 @@ async def create_account(
     mail_api = config.get("mail_api", "https://convergence-lobby-portal-planes.trycloudflare.com/new_address")
 
     # Create temp email
+    # Keep email_gen alive — pass it to verify_cloudflare_email so it can
+    # reuse _active_url (the relay that actually created the email).
+    # Closing it here loses the relay context and breaks inbox polling.
     email_gen = EmailGenerator(mail_api, config["mail_domains"], fallback_url=config.get("mail_fallback"))
     try:
         mail = email_gen.create(username=username, domain=domain)
         email = mail["email"]
     except Exception as e:
-        return {"status": "error", "error": f"Email creation failed: {e}", "email": f"{username}@{domain}"}
-    finally:
         email_gen.close()
+        return {"status": "error", "error": f"Email creation failed: {e}", "email": f"{username}@{domain}"}
 
     print(f"  📧 {email}")
 
@@ -187,7 +189,18 @@ async def create_account(
     try:
         # Phase 0: Navigate to signup
         print("  [0/4] Pre-flight check...")
-        page = await browser.get("https://dash.cloudflare.com/sign-up")
+        try:
+            page = await asyncio.wait_for(
+                browser.get("https://dash.cloudflare.com/sign-up"),
+                timeout=30,
+            )
+        except asyncio.TimeoutError:
+            return {
+                "status": "error",
+                "email": email,
+                "password": password,
+                "error": "Page load timeout (30s) — check proxy or network",
+            }
         await asyncio.sleep(8)
         print("    ✅ Page ready")
             
@@ -211,7 +224,8 @@ async def create_account(
         print(f"  🆔 Account ID: {account_id}")
 
         # Verify Cloudflare email from temp inbox before token creation.
-        # Cloudflare rejects final token creation for fresh direct-signup accounts otherwise.
+        # Pass email_gen so verify can reuse the same _active_url relay
+        # that created the email (creating a new EmailGenerator loses context).
         print("  [2/4] Verifying Cloudflare email...")
         verify_result = await verify_cloudflare_email(
             page,
@@ -219,11 +233,15 @@ async def create_account(
             jwt=mail.get("jwt", ""),
             timeout=config.get("email_verify_timeout", 120),
             poll_interval=config.get("email_verify_poll_interval", 5),
+            email_gen=email_gen,
         )
         if verify_result.success:
             print("  ✅ Email verified")
         else:
             print(f"  ⚠️ Email verification failed: {verify_result.error}")
+
+        # Now safe to close email_gen — verification polling is done
+        email_gen.close()
 
         # Phase 2: Token creation — reuse same browser session.
         # After email verification, the direct dashboard API is the most stable path;
@@ -276,6 +294,11 @@ async def create_account(
         return result
 
     except Exception as e:
+        # Ensure email_gen is closed if we crashed before normal close
+        try:
+            email_gen.close()
+        except Exception:
+            pass
         return {
             "status": "error",
             "email": email,

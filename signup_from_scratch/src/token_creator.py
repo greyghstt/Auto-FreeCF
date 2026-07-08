@@ -84,7 +84,7 @@ def _loads_wrapped_json(raw: Any, default: Any = None) -> Any:
 
 
 async def _get_body_text(page: uc.Tab) -> str:
-    raw = await page.evaluate("document.body ? document.body.innerText : ''")
+    raw = await page.evaluate("document.body ? document.body.innerText : ''", return_by_value=True)
     return str(_unwrap_nodriver_value(raw, default=""))
 
 
@@ -94,7 +94,7 @@ async def get_account_id(page: uc.Tab, known_account_id: str = "") -> str:
         return known_account_id
 
     try:
-        url = str(await page.evaluate("location.href"))
+        url = str(_unwrap_nodriver_value(await page.evaluate("location.href", return_by_value=True)))
         m = re.search(r"/([a-f0-9]{32})(?:/|$)", url)
         if m:
             return m.group(1)
@@ -259,7 +259,8 @@ async def _focused_checkbox_state(page: uc.Tab) -> dict:
                 y: Math.round(rect.y)
             });
         })()
-        """
+        """,
+        return_by_value=True,
     )
     return _loads_wrapped_json(raw, default={}) or {}
 
@@ -291,9 +292,17 @@ async def create_token_ui(
     clicked = False
     for entry_url in entry_urls:
         await page.get(entry_url)
-        await asyncio.sleep(12)
+        # Wait for page to settle — poll for readyState instead of blind sleep
+        for _ in range(20):  # max 10s
+            ready = _unwrap_nodriver_value(
+                await page.evaluate("document.readyState", return_by_value=True)
+            )
+            if str(ready) == "complete":
+                break
+            await asyncio.sleep(0.5)
+        await asyncio.sleep(2)  # extra settle for React SPA
 
-        current_url = str(await page.evaluate("location.href"))
+        current_url = str(_unwrap_nodriver_value(await page.evaluate("location.href", return_by_value=True)))
         if "login" in current_url.lower():
             return TokenResult(False, token_name=token_name, error="Not logged in — session expired", method="ui")
 
@@ -316,7 +325,14 @@ async def create_token_ui(
                     await btn.scroll_into_view()
                     await asyncio.sleep(0.5)
                     await btn.click()
-                    await asyncio.sleep(10)
+                    # Poll for navigation instead of blind 10s sleep
+                    for _ in range(20):
+                        await asyncio.sleep(0.5)
+                        nav_url = str(_unwrap_nodriver_value(
+                            await page.evaluate("location.href", return_by_value=True)
+                        ))
+                        if "/create" in nav_url or nav_url != entry_url:
+                            break
                     clicked = True
                     break
             except Exception:
@@ -416,7 +432,12 @@ async def create_token_ui(
                 await btn.scroll_into_view()
                 await asyncio.sleep(0.8)
                 await btn.click()
-                await asyncio.sleep(12)
+                # Poll for next page instead of blind 12s sleep
+                for _ in range(24):
+                    await asyncio.sleep(0.5)
+                    body = await _get_body_text(page)
+                    if "Create token" in body or "Please verify your email" in body:
+                        break
                 reviewed = True
                 break
         except Exception:
@@ -440,7 +461,12 @@ async def create_token_ui(
                 await btn.scroll_into_view()
                 await asyncio.sleep(0.8)
                 await btn.click()
-                await asyncio.sleep(18)
+                # Poll for token to appear instead of blind 18s sleep
+                for _ in range(36):  # max 18s
+                    await asyncio.sleep(0.5)
+                    body = await _get_body_text(page)
+                    if "cfut_" in body or "Please verify your email" in body:
+                        break
                 final_clicked = True
                 break
         except Exception:
