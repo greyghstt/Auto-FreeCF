@@ -71,7 +71,7 @@ def parse_args():
     )
     parser.add_argument(
         "--proxy", "-p", type=str, default=None,
-        help="Proxy URL (http://user:pass@host:port)"
+        help="Proxy URL (http://user:pass@host:port) or file path with one proxy per line"
     )
     parser.add_argument(
         "--output", "-o", type=str, default=None,
@@ -348,11 +348,34 @@ async def main():
 
     # Load config
     config = load_config(args.config)
-    proxy = args.proxy or config.get("proxy")
+    proxy_arg = args.proxy or config.get("proxy")
     output_file = args.output or config.get("output_file", "results.json")
     delay = args.delay if args.delay is not None else config.get("delay_between_accounts", 300)
     num_accounts = args.accounts
     max_retry = args.retry
+
+    # Proxy rotation: if proxy_arg is a file path, load proxy list for rotation
+    proxy_pool: list[str] = []
+    single_proxy: str = None
+    if proxy_arg:
+        proxy_path = Path(proxy_arg)
+        if proxy_path.exists() and proxy_path.is_file():
+            # Load proxy list from file
+            for line in proxy_path.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    proxy_pool.append(line)
+            print(f"  🔄 Loaded {len(proxy_pool)} proxies from {proxy_arg}")
+        else:
+            # Single proxy URL
+            single_proxy = proxy_arg
+            proxy_pool = [proxy_arg]
+
+    def get_proxy_for_account(index: int) -> str:
+        """Round-robin proxy selection for bulk runs."""
+        if not proxy_pool:
+            return None
+        return proxy_pool[index % len(proxy_pool)]
 
     # Override mail API from CLI
     if args.mail_api:
@@ -376,7 +399,7 @@ async def main():
     print("☁️  Cloudflare Auto Signup — Workers AI Token Creator")
     print("=" * 60)
     print(f"  Accounts to create: {num_accounts}")
-    print(f"  Proxy: {proxy or 'None (direct)'}")
+    print(f"  Proxy: {single_proxy or (f'{len(proxy_pool)} proxies (rotation)' if proxy_pool else 'None (direct)')}")
     print(f"  Delay between: {delay}s")
     print(f"  Output: {output_file}")
     print(f"  Headless: {args.headless or config.get('headless', False)}")
@@ -406,7 +429,7 @@ async def main():
 
             result = await create_account(
                 config=config,
-                proxy=proxy,
+                proxy=get_proxy_for_account(index),
                 headless=args.headless or config.get("headless", False),
                 fast=args.fast,
                 window_size=args.window_size,
@@ -422,21 +445,30 @@ async def main():
                 # Account created but no token — still save for forensic/debug visibility.
                 success = True
                 break
+
+            error_str = str(result.get("error", "")).lower()
+
+            # Fatal errors — retrying won't help
             if any(
-                marker in str(result.get("error", "")).lower()
-                for marker in ("rate", "unable", "connection closed", "no close frame")
+                marker in error_str
+                for marker in ("all mail relays failed", "connection refused", "connectionerror")
+            ):
+                break
+
+            # Transient errors — wait and retry (DON'T break)
+            if any(
+                marker in error_str
+                for marker in ("rate", "unable", "connection closed", "no close frame", "timeout")
             ):
                 dashboard_state.update(worker_id, "failed", "Transient issue; retry cooldown", email=result.get("email", ""), index=index)
                 await asyncio.sleep(delay)
+                continue  # ← retry the loop
 
-            if any(
-                marker in str(result.get("error", "")).lower()
-                for marker in ("all mail relays failed", "connection refused", "connectionerror")
-            ):
-                # Network/config issue — retrying won't fix this
-                break
-            else:
-                break
+            # Unknown error — retry once more if attempts remain
+            # (previously: else: break → killed ALL retries)
+            if attempt < max_retry - 1:
+                continue
+            break
 
         async with save_lock:
             save_result(result, output_file)
@@ -474,7 +506,7 @@ async def main():
     print(f"📊 Results: {created} created, {failed} failed")
     print(f"💾 Saved to: {output_file}")
     if args.export_txt:
-        exported = export_txt(results, args.export_txt, proxy_pool=("None" if not proxy else "configured-proxy"))
+        exported = export_txt(results, args.export_txt, proxy_pool=("None" if not proxy_pool else f"{len(proxy_pool)}-proxy-rotation"))
         print(f"🧩 9Router TXT export: {args.export_txt} ({exported} valid keys)")
     if run_results:
         print(f"\nAccounts:")

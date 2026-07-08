@@ -12,9 +12,13 @@ Environment variables:
 import json
 import os
 import time
+import threading
 from urllib.parse import urlparse, parse_qs
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+
+# File lock for concurrent token_map access
+_MAP_LOCK = threading.Lock()
 
 # Try loading .env file
 env_path = Path(__file__).parent / ".env"
@@ -86,21 +90,25 @@ def _request_with_retry(method, url, max_retries=3, **kwargs):
     raise last_error
 
 
-def supabase_create(domain: str) -> dict:
+def supabase_create(domain: str, name: str = None) -> dict:
     """Create email via Supabase API."""
+    payload = {"domain": domain}
+    if name:
+        payload["name"] = name
     r = _request_with_retry(
         "POST",
         f"{API_BASE}?action=create",
         headers=HEADERS,
-        json={"domain": domain},
+        json=payload,
     )
     data = r.json()
-    # Store mapping for later lookups
-    TOKEN_MAP[data["owner_token"]] = {
-        "owner_token": data["owner_token"],
-        "address": data["address"],
-    }
-    _save_map(TOKEN_MAP)
+    # Store mapping for later lookups (thread-safe)
+    with _MAP_LOCK:
+        TOKEN_MAP[data["owner_token"]] = {
+            "owner_token": data["owner_token"],
+            "address": data["address"],
+        }
+        _save_map(TOKEN_MAP)
     return data
 
 
@@ -280,8 +288,9 @@ class AdapterHandler(BaseHTTPRequestHandler):
 
         if path == "/api/new_address" or path == "/new_address":
             domain = body.get("domain", "gmilio.web.id")
+            name = body.get("name") or body.get("username")
             try:
-                data = supabase_create(domain)
+                data = supabase_create(domain, name=name)
                 self._json({
                     "address": data["address"],
                     "jwt": f"{data['owner_token']}::{data['address']}",

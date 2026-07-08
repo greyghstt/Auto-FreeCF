@@ -269,7 +269,7 @@ async def solve_turnstile(page, quick: bool = False) -> str:
     Returns:
         Token string or empty string if failed
     """
-    timeout = 15.0 if quick else 60.0
+    timeout = 15.0 if quick else 45.0
 
     # Strategy 1: Check if token already populated (passive solve or manual)
     existing_token = await _get_challenge_token(page)
@@ -290,17 +290,19 @@ async def solve_turnstile(page, quick: bool = False) -> str:
             return token
         return ""  # Don't block — let submit-first handle it
 
-    # Strategy 3: Full verify_cf with longer timeout
-    token = await _verify_cf_and_poll(page, timeout=30.0)
-    if token:
-        return token
-
-    # Strategy 4: CDP interaction + wait for token
+    # Strategy 3: CDP interaction + extended wait for token
+    # (different from strategy 2: uses real mouse events, not template matching)
     await quick_interact(page)
     await asyncio.sleep(3)
 
-    # Wait for token to appear
-    token = await _wait_for_token(page, timeout=30.0)
+    # Wait for token to appear with longer timeout
+    token = await _wait_for_token(page, timeout=45.0)
+    if token:
+        return token
+
+    # Strategy 4: Last resort — try verify_cf again with longer timeout
+    # (sometimes the first click didn't register, second click does)
+    token = await _verify_cf_and_poll(page, timeout=15.0)
     if token:
         return token
 

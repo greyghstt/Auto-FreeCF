@@ -66,8 +66,30 @@ async def _fill_form(page: uc.Tab, email: str, password: str) -> Optional[str]:
         return "Email input not found"
     await email_input.click()
     await asyncio.sleep(0.5)
+    # Clear field first (in case of retry — old text would be appended)
+    try:
+        await email_input.clear_input()
+    except Exception:
+        pass
     await email_input.send_keys(email)
     await asyncio.sleep(1)
+
+    # Verify text was actually entered (React forms can swallow keystrokes)
+    actual = _unwrap(
+        await page.evaluate(
+            """document.querySelector('input[name="email"]')?.value || ''""",
+            return_by_value=True,
+        )
+    )
+    if str(actual) != email:
+        # Retry: clear via JS and re-type
+        await page.evaluate(
+            """const el = document.querySelector('input[name="email"]'); if (el) { el.value = ''; el.dispatchEvent(new Event('input', {bubbles: true})); }""",
+            return_by_value=True,
+        )
+        await email_input.click()
+        await email_input.send_keys(email)
+        await asyncio.sleep(1)
 
     # Password
     pw_input = None
@@ -80,6 +102,10 @@ async def _fill_form(page: uc.Tab, email: str, password: str) -> Optional[str]:
         return "Password input not found"
     await pw_input.click()
     await asyncio.sleep(0.5)
+    try:
+        await pw_input.clear_input()
+    except Exception:
+        pass
     await pw_input.send_keys(password)
     await asyncio.sleep(2)
 
@@ -175,12 +201,25 @@ async def _submit_form(page: uc.Tab) -> Optional[str]:
 
 
 async def _wait_for_redirect(page: uc.Tab, max_wait: int = 30) -> str:
-    """Wait for signup redirect. Returns final URL."""
+    """Wait for signup redirect. Returns final URL.
+    
+    Checks that URL changed away from /sign-up AND page has content
+    (avoids false positive on intermediate loading pages).
+    """
     for _ in range(max_wait):
         await asyncio.sleep(1)
         url = str(_unwrap(await page.evaluate("location.href", return_by_value=True)))
+        # Must be off the sign-up page
         if "/sign-up" not in url:
-            return url
+            # Also verify page has actual content (not just a blank redirect)
+            body_len = _unwrap(
+                await page.evaluate(
+                    "document.body ? document.body.innerText.length : 0",
+                    return_by_value=True,
+                )
+            )
+            if int(body_len or 0) > 50:
+                return url
     return str(_unwrap(await page.evaluate("location.href", return_by_value=True)))
 
 
