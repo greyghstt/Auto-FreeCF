@@ -115,6 +115,14 @@ def parse_args():
         "--fast", action="store_true",
         help="Submit-first mode: quick Turnstile interaction, submit immediately, retry only if blocked"
     )
+    parser.add_argument(
+        "--wait-captcha", action="store_true",
+        help="Hybrid mode: pause for manual CAPTCHA click, then auto-submit"
+    )
+    parser.add_argument(
+        "--window-size", type=str, default="1280,1024",
+        help="Browser window size WxH"
+    )
     return parser.parse_args()
 
 
@@ -124,6 +132,8 @@ async def create_account(
     headless: bool = False,
     browser: uc.Browser = None,
     fast: bool = False,
+    wait_captcha: bool = False,
+    window_size: str = "1280,1024",
 ) -> dict:
     """
     Create a single Cloudflare account with API token.
@@ -157,7 +167,8 @@ async def create_account(
             headless=headless,
             lang="en-US",
             proxy=proxy,
-            sandbox=False,  # required when running as root in VPS/Xvfb
+            sandbox=False,
+            browser_args=[f"--window-size={window_size}"],
         )
         own_browser = True
 
@@ -170,7 +181,7 @@ async def create_account(
             
         # Phase 1: Signup
         print("  [1/4] Signing up...")
-        signup_result = await signup(page, email, password, retry_turnstile=not fast)
+        signup_result = await signup(page, email, password, retry_turnstile=not fast, wait_captcha=wait_captcha)
 
         if not signup_result.success:
             return {
@@ -359,6 +370,8 @@ async def main():
                 proxy=proxy,
                 headless=args.headless or config.get("headless", False),
                 fast=args.fast,
+                wait_captcha=args.wait_captcha,
+                window_size=args.window_size,
             )
             if result.get("email"):
                 dashboard_state.update(worker_id, "validate", result.get("status", "done"), email=result["email"], index=index)

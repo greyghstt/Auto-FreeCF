@@ -98,8 +98,11 @@ async def _try_solve_turnstile(page: uc.Tab, quick: bool = False) -> str:
     if not turnstile_present:
         return ""
 
-    # Scroll to make Turnstile visible
-    await page.evaluate("window.scrollBy(0, 400)")
+    # Gently scroll Turnstile widget into view (no hard pixel offset)
+    await page.evaluate("""
+        const w = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+        if (w) w.scrollIntoView({block: 'center', behavior: 'smooth'});
+    """)
     await asyncio.sleep(2)
 
     return await solve_turnstile(page, quick=quick)
@@ -127,13 +130,21 @@ async def _wait_for_redirect(page: uc.Tab, max_wait: int = 30) -> str:
 
 
 async def _extract_account_id(page: uc.Tab, url: str) -> Optional[str]:
-    """Extract Account ID from URL or DOM."""
+    """Extract Account ID from URL or DOM. Waits for final redirect if needed."""
     # Try URL first
     match = re.search(r"/([a-f0-9]{32})", url)
     if match:
         return match.group(1)
 
-    # Try DOM
+    # URL might be intermediate redirect (e.g. /?to=...). Wait for final URL.
+    for _ in range(20):
+        await asyncio.sleep(2)
+        current_url = str(_unwrap(await page.evaluate("location.href")))
+        match = re.search(r"/([a-f0-9]{32})", current_url)
+        if match:
+            return match.group(1)
+
+    # Try DOM data attributes
     account_id = _unwrap(await page.evaluate("""
         (() => {
             const el = document.querySelector('[data-account-id], [data-testid="account-id"]');
@@ -141,8 +152,22 @@ async def _extract_account_id(page: uc.Tab, url: str) -> Optional[str]:
             return null;
         })()
     """))
+    if account_id and re.match(r'^[a-f0-9]{32}$', str(account_id).strip()):
+        return str(account_id).strip()
+
+    # Try extracting from any link on the dashboard that contains a 32-char hex
+    account_id = _unwrap(await page.evaluate("""
+        (() => {
+            const links = document.querySelectorAll('a[href]');
+            for (const a of links) {
+                const m = a.href.match(new RegExp('/([a-f0-9]{32})'));
+                if (m) return m[1];
+            }
+            return null;
+        })()
+    """))
     if account_id:
-        return account_id.strip()
+        return str(account_id).strip()
 
     return None
 
@@ -160,12 +185,35 @@ async def _check_errors(page: uc.Tab) -> str:
     return ""
 
 
+
+async def _wait_for_manual_captcha(page: uc.Tab, timeout: int = 120) -> bool:
+    """Wait for user to manually click CAPTCHA. Polls cf-turnstile-response value.
+    Returns True if token appeared (user solved it), False on timeout."""
+    print(f"    >>> WAITING FOR MANUAL CAPTCHA CLICK (max {timeout}s) <<<")
+    print(f"    >>> Page is zoomed out to keep CAPTCHA and submit visible without scrolling. <<<")
+    for elapsed in range(timeout):
+        token = _unwrap(await page.evaluate("""
+            (() => {
+                const inp = document.querySelector('input[name="cf-turnstile-response"]')
+                    || document.querySelector('input[name="cf_challenge_response"]');
+                return inp ? inp.value : '';
+            })()
+        """))
+        if token and len(str(token)) > 10:
+            print(f"    >>> CAPTCHA solved by user after {elapsed}s <<<")
+            return True
+        await asyncio.sleep(1)
+    print(f"    >>> CAPTCHA wait timed out after {timeout}s <<<")
+    return False
+
+
 async def signup(
     page: uc.Tab,
     email: str,
     password: str,
     max_wait: int = 30,
     retry_turnstile: bool = True,
+    wait_captcha: bool = False,
 ) -> SignupResult:
     """
     Execute Cloudflare signup with submit-first strategy.
@@ -188,19 +236,37 @@ async def signup(
     """
     # ─── Navigate ───
     await page.get(CLOUDFLARE_SIGNUP_URL)
-    await asyncio.sleep(8)
+    await asyncio.sleep(2)
+
+    # Zoom out early so password hints do not push CAPTCHA below the viewport.
+    await page.evaluate("document.body.style.zoom = '65%'")
+    await asyncio.sleep(6)
 
     # ─── Fill Form ───
     error = await _fill_form(page, email, password)
     if error:
         return SignupResult(False, email=email, error=error)
 
-    # ─── Quick Turnstile (non-blocking) ───
-    token = await _try_solve_turnstile(page, quick=True)
-    if token:
-        print(f"    ✅ Turnstile solved: {token[:20]}...")
+    # ─── Turnstile handling ───
+    if wait_captcha:
+        # Hybrid mode: scroll captcha into view and wait for user to click it
+        await page.evaluate("""
+            const w = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+            if (w) w.scrollIntoView({block: 'center', behavior: 'smooth'});
+        """)
+        await asyncio.sleep(1)
+        solved = await _wait_for_manual_captcha(page, timeout=120)
+        if solved:
+            print(f"    ✅ CAPTCHA solved manually")
+        else:
+            print(f"    ⚠️ CAPTCHA not solved, attempting submit anyway")
     else:
-        print(f"    ⚡ Turnstile quick-interact (submit-first)")
+        # Auto mode: quick Turnstile interaction (non-blocking)
+        token = await _try_solve_turnstile(page, quick=True)
+        if token:
+            print(f"    ✅ Turnstile solved: {token[:20]}...")
+        else:
+            print(f"    ⚡ Turnstile quick-interact (submit-first)")
 
     # ─── Submit Form ───
     error = await _submit_form(page)
