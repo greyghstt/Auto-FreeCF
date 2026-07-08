@@ -1,12 +1,18 @@
 """Shared utilities for Cloudflare Auto Signup."""
 
 import json
+import logging
 import random
 import string
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+# Structured logging
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+logger = logging.getLogger("autofreecf")
 
 
 def generate_password(length: int = 12) -> str:
@@ -26,15 +32,41 @@ def generate_username(prefix: str = "cf", length: int = 5) -> str:
     return f"{prefix}{random.randint(10**(length-1), 10**length - 1)}"
 
 
+def validate_config(config: dict) -> list[str]:
+    """Validate required config fields. Returns list of errors."""
+    errors = []
+    required = ["mail_domains"]
+    for field in required:
+        if field not in config:
+            errors.append(f"Missing required config field: {field}")
+    if "mail_api" not in config and "mail_fallback" not in config:
+        errors.append("At least one of mail_api or mail_fallback must be set in config")
+    if not config.get("mail_domains"):
+        errors.append("mail_domains must be a non-empty list")
+    return errors
+
+
 def load_config(config_path: str = "config.json") -> dict:
-    """Load configuration from JSON file."""
+    """Load configuration from JSON file with validation."""
     path = Path(config_path)
     if not path.exists():
-        path = Path(config_path.replace(".json", ".example.json"))
-    if not path.exists():
-        raise FileNotFoundError(f"Config not found: {config_path}")
+        fallback = Path(config_path.replace(".json", ".example.json"))
+        if fallback.exists():
+            logger.warning(f"Config {config_path} not found, using {fallback}")
+            path = fallback
+        else:
+            raise FileNotFoundError(f"Config not found: {config_path} (checked {config_path} and {fallback})")
+
     with open(path) as f:
-        return json.load(f)
+        config = json.load(f)
+
+    # Validate
+    errors = validate_config(config)
+    if errors:
+        for err in errors:
+            logger.error(f"Config error: {err}")
+
+    return config
 
 
 def save_result(result: dict, output_file: str = "results.json") -> None:

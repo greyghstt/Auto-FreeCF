@@ -26,6 +26,8 @@ CF_VERIFY_PATTERNS = [
     r'https://dash\.cloudflare\.com/[^\"><\s]+',
     r'https://www\.cloudflare\.com/[^\"><\s]+',
     r'https://cloudflare\.com/[^\"><\s]+',
+    # Worker URL pattern for email verification
+    r'https://[a-z0-9-]+\.workers\.dev/[^\"><\s]+',
 ]
 
 
@@ -41,7 +43,7 @@ def _mail_blob(mail: dict[str, Any]) -> str:
 def _is_cloudflare_verification(mail: dict[str, Any]) -> bool:
     blob = _mail_blob(mail).lower()
     return "cloudflare" in blob and any(
-        word in blob for word in ("verify", "verification", "confirm", "activate", "email")
+        word in blob for word in ("verify", "verification", "confirm", "activate", "email", "welcome")
     )
 
 
@@ -60,7 +62,7 @@ def extract_verification_link(mail: dict[str, Any]) -> str:
         url = unquote(url)
         low = url.lower()
         # Keep likely action links, drop generic marketing/docs links.
-        if any(k in low for k in ("verify", "confirm", "activation", "email", "token", "challenge")):
+        if any(k in low for k in ("verify", "confirm", "activation", "email", "token", "challenge", "welcome")):
             cleaned.append(url)
 
     # Fallback: if only dash.cloudflare.com links are present, use the first one.
@@ -88,13 +90,21 @@ async def verify_cloudflare_email(
     gen = EmailGenerator(mail_api, [])
     start = time.time()
 
+    # Adaptive polling: start fast, slow down over time
+    intervals = [3, 3, 5, 5, 10, 10, 15]
+
     try:
+        poll_idx = 0
         while time.time() - start < timeout:
+            # Adaptive: check less frequently over time
+            current_interval = intervals[min(poll_idx, len(intervals) - 1)]
+            
             try:
                 mails = gen.check_inbox(jwt, limit=20, offset=0)
             except Exception as e:
                 print(f"  [verify] inbox error: {e}")
-                await asyncio.sleep(poll_interval)
+                await asyncio.sleep(current_interval)
+                poll_idx += 1
                 continue
 
             for mail in mails:
@@ -133,11 +143,15 @@ async def verify_cloudflare_email(
                     return EmailVerifyResult(True, link=link)
 
                 if "expired" in body or "invalid" in body:
-                    return EmailVerifyResult(False, error="verification_link_invalid_or_expired", link=link)
+                    print("  [verify] Link expired, will retry polling for a fresher email...")
+                    # Don't return failure immediately — keep polling for another email
+                    continue
 
+                # Assume success if link opened without error
                 return EmailVerifyResult(True, link=link)
 
-            await asyncio.sleep(poll_interval)
+            await asyncio.sleep(current_interval)
+            poll_idx += 1
 
         return EmailVerifyResult(False, error=f"verification_email_not_found_after_{timeout}s")
     finally:

@@ -2,17 +2,11 @@
 """
 Mail Adapter — Supabase temp-mail API → bluk-cf compatible format.
 
-bluk-cf expects:
-  POST /api/new_address    {domain}        → {address, jwt}
-  GET  /parsed_mails       Bearer {jwt}    → [mail, ...]
-  GET  /parsed_mail/{id}   Bearer {jwt}    → {mail}
-
-Supabase API (what we have):
-  POST ?action=create      {domain} + x-api-key          → {address, owner_token}
-  GET  ?action=messages    {owner_token, address} + x-api-key → {messages: [...]}
-  GET  ?action=message     {owner_token, message_id} + x-api-key → {mail}
-
-This adapter translates between the two, storing owner_token↔address mappings.
+Supports .env file for credentials (gitignored).
+Environment variables:
+  API_BASE - Supabase temp-mail API URL (default: hardcoded)
+  TMK_KEY  - API key (default: hardcoded fallback)
+  PORT     - HTTP server port (default: 9877)
 """
 
 import json
@@ -20,6 +14,16 @@ import os
 import time
 from urllib.parse import urlparse, parse_qs
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+
+# Try loading .env file
+env_path = Path(__file__).parent / ".env"
+if env_path.exists():
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip("'\""))
 
 import requests
 
@@ -52,15 +56,44 @@ DEFAULT_DOMAINS = [
 ]
 
 
+def _request_with_retry(method, url, max_retries=3, **kwargs):
+    """Make HTTP request with retry and exponential backoff."""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            r = requests.request(method, url, timeout=30, **kwargs)
+            r.raise_for_status()
+            return r
+        except requests.exceptions.ConnectionError as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+        except requests.exceptions.Timeout as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(1)
+        except requests.exceptions.HTTPError as e:
+            # Non-5xx errors don't retry
+            if e.response is not None and e.response.status_code < 500:
+                raise
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+    raise last_error
+
+
 def supabase_create(domain: str) -> dict:
     """Create email via Supabase API."""
-    r = requests.post(
+    r = _request_with_retry(
+        "POST",
         f"{API_BASE}?action=create",
         headers=HEADERS,
         json={"domain": domain},
-        timeout=30
     )
-    r.raise_for_status()
     data = r.json()
     # Store mapping for later lookups
     TOKEN_MAP[data["owner_token"]] = {
@@ -73,26 +106,24 @@ def supabase_create(domain: str) -> dict:
 
 def supabase_messages(owner_token: str, address: str) -> list:
     """Get messages for an address."""
-    r = requests.get(
+    r = _request_with_retry(
+        "GET",
         f"{API_BASE}?action=messages",
         headers=HEADERS,
         params={"owner_token": owner_token, "address": address},
-        timeout=30
     )
-    r.raise_for_status()
     data = r.json()
     return data.get("messages", []) if isinstance(data, dict) else []
 
 
 def supabase_message(owner_token: str, message_id) -> dict:
     """Get single message content."""
-    r = requests.get(
+    r = _request_with_retry(
+        "GET",
         f"{API_BASE}?action=message",
         headers=HEADERS,
         params={"owner_token": owner_token, "id": message_id},
-        timeout=30
     )
-    r.raise_for_status()
     data = r.json()
     # Supabase returns {"message": {...}}
     msg = data.get("message", data)
@@ -127,12 +158,7 @@ def _normalize_mail(raw: dict, mail_id: str = "") -> dict:
 def supabase_domains() -> list:
     """Get available domains."""
     try:
-        r = requests.get(
-            f"{API_BASE}?action=domains",
-            headers=HEADERS,
-            timeout=15
-        )
-        r.raise_for_status()
+        r = _request_with_retry("GET", f"{API_BASE}?action=domains", headers=HEADERS)
         data = r.json()
         return data.get("domains", [])
     except Exception:
@@ -190,24 +216,6 @@ class AdapterHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type,Authorization")
         self.end_headers()
 
-    def do_POST(self):
-        path = urlparse(self.path).path
-        body = self._read_body()
-
-        if path == "/api/new_address":
-            domain = body.get("domain", "gmilio.web.id")
-            try:
-                data = supabase_create(domain)
-                self._json({
-                    "address": data["address"],
-                    "jwt": f"{data['owner_token']}::{data['address']}",
-                    "domain": data.get("domain", domain),
-                })
-            except Exception as e:
-                self._error(str(e), 500)
-        else:
-            self._error("Not found", 404)
-
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -215,6 +223,15 @@ class AdapterHandler(BaseHTTPRequestHandler):
         if path.startswith("/api/"):
             path = path[4:]
         params = parse_qs(parsed.query)
+
+        # Health check
+        if path == "/health":
+            self._json({
+                "status": "ok",
+                "backend": API_BASE,
+                "mappings": len(TOKEN_MAP),
+            })
+            return
 
         if path == "/domains":
             try:
@@ -257,6 +274,24 @@ class AdapterHandler(BaseHTTPRequestHandler):
 
         self._error("Not found", 404)
 
+    def do_POST(self):
+        path = urlparse(self.path).path
+        body = self._read_body()
+
+        if path == "/api/new_address":
+            domain = body.get("domain", "gmilio.web.id")
+            try:
+                data = supabase_create(domain)
+                self._json({
+                    "address": data["address"],
+                    "jwt": f"{data['owner_token']}::{data['address']}",
+                    "domain": data.get("domain", domain),
+                })
+            except Exception as e:
+                self._error(str(e), 500)
+        else:
+            self._error("Not found", 404)
+
     def log_message(self, format, *args):
         """Quiet logging."""
         pass
@@ -264,9 +299,10 @@ class AdapterHandler(BaseHTTPRequestHandler):
 
 def main():
     port = int(os.environ.get("PORT", "9877"))
-    server = HTTPServer(("0.0.0.0", port), AdapterHandler)
+    server = HTTPServer(("127.0.0.1", port), AdapterHandler)
     print(f"Mail adapter running on port {port}")
     print(f"Backend: {API_BASE}")
+    print(f"Health: http://127.0.0.1:{port}/health")
     server.serve_forever()
 
 

@@ -1,5 +1,5 @@
 """
-Cloudflare Signup Flow — Submit-first strategy.
+Cloudflare Signup Flow — Submit-first strategy with hybrid CAPTCHA support.
 
 Flow:
 1. Navigate to sign-up page
@@ -7,6 +7,7 @@ Flow:
 3. Quick Turnstile interaction (don't block on solve)
 4. Submit form IMMEDIATELY
 5. If redirect fails → proper Turnstile solve + resubmit
+6. Hybrid mode: --wait-captcha pauses for manual CAPTCHA solve
 
 The insight: CF signup is lenient. A partially-interacted Turnstile
 often passes. Only fall back to full solve if the initial submit fails.
@@ -92,22 +93,91 @@ async def _fill_form(page: uc.Tab, email: str, password: str) -> Optional[str]:
     return None
 
 
+async def _scroll_turnstile_into_view(page: uc.Tab) -> None:
+    """Smart scroll: find Turnstile iframe and scroll it into center viewport."""
+    await page.evaluate("""
+        (() => {
+            const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+            if (iframe) {
+                iframe.scrollIntoView({behavior: 'instant', block: 'center'});
+                // Also scroll down a bit to show the Sign Up button too
+                window.scrollBy(0, 150);
+                return true;
+            }
+            // Fallback: try cf_challenge_response input
+            const input = document.querySelector('input[name="cf-turnstile-response"], input[name="cf_challenge_response"]');
+            if (input) {
+                input.scrollIntoView({behavior: 'instant', block: 'center'});
+                return true;
+            }
+            return false;
+        })()
+    """)
+    await asyncio.sleep(1)
+
+
 async def _try_solve_turnstile(page: uc.Tab, quick: bool = False) -> str:
     """Try to solve Turnstile. Returns token or empty string."""
     turnstile_present = await is_turnstile_present(page)
     if not turnstile_present:
         return ""
 
-    # Scroll to make Turnstile visible
-    await page.evaluate("window.scrollBy(0, 400)")
-    await asyncio.sleep(2)
+    # Smart scroll to Turnstile widget
+    await _scroll_turnstile_into_view(page)
+    await asyncio.sleep(1)
 
     return await solve_turnstile(page, quick=quick)
+
+
+async def _has_challenge_response(page: uc.Tab) -> bool:
+    """Check if cf_challenge_response has a value."""
+    val = _unwrap(await page.evaluate("""
+        (() => {
+            const el = document.querySelector('input[name="cf_challenge_response"]');
+            if (el && el.value && el.value.length > 5) return el.value;
+            const el2 = document.querySelector('input[name="cf-turnstile-response"]');
+            if (el2 && el2.value && el2.value.length > 5) return el2.value;
+            return '';
+        })()
+    """))
+    return bool(val and len(str(val)) > 5)
+
+
+async def _wait_for_manual_captcha(
+    page: uc.Tab,
+    timeout: int = 600,
+    poll_interval: int = 3,
+) -> bool:
+    """
+    Hybrid mode: wait for user to manually click/complete the CAPTCHA.
+    Returns True when cf_challenge_response has a token.
+    """
+    print("    ⏸️  HYBRID MODE: Browser is paused at sign-up form.")
+    print("    Please complete the CAPTCHA manually in the browser window.")
+    print(f"    Auto-resuming when CAPTCHA solved (timeout: {timeout}s)...")
+
+    for elapsed in range(0, timeout, poll_interval):
+        solved = await _has_challenge_response(page)
+        if solved:
+            print(f"    ✅ CAPTCHA solved manually after {elapsed}s")
+            return True
+        if elapsed > 0 and elapsed % 30 == 0:
+            print(f"    Still waiting for CAPTCHA... ({elapsed}s)")
+        await asyncio.sleep(poll_interval)
+
+    print(f"    ⚠️ CAPTCHA not solved within {timeout}s — continuing with best effort")
+    return False
 
 
 async def _submit_form(page: uc.Tab) -> Optional[str]:
     """Click submit button. Returns error string or None."""
     submit_btn = await page.select('button[type="submit"]', timeout=5)
+    if not submit_btn:
+        # Try finding submit button by text content
+        try:
+            submit_btn = await page.find("Sign Up", best_match=True, timeout=3)
+        except Exception:
+            pass
     if not submit_btn:
         return "Submit button not found"
     await submit_btn.scroll_into_view()
@@ -166,6 +236,7 @@ async def signup(
     password: str,
     max_wait: int = 30,
     retry_turnstile: bool = True,
+    wait_captcha: bool = False,
 ) -> SignupResult:
     """
     Execute Cloudflare signup with submit-first strategy.
@@ -182,6 +253,7 @@ async def signup(
         password: Password
         max_wait: Max seconds to wait for redirect
         retry_turnstile: Whether to retry with proper solve on failure
+        wait_captcha: Hybrid mode — pause for manual CAPTCHA solve
 
     Returns:
         SignupResult with account_id on success
@@ -195,12 +267,17 @@ async def signup(
     if error:
         return SignupResult(False, email=email, error=error)
 
-    # ─── Quick Turnstile (non-blocking) ───
-    token = await _try_solve_turnstile(page, quick=True)
-    if token:
-        print(f"    ✅ Turnstile solved: {token[:20]}...")
+    # ─── Hybrid mode: wait for manual CAPTCHA ───
+    if wait_captcha:
+        await _scroll_turnstile_into_view(page)
+        await _wait_for_manual_captcha(page)
     else:
-        print(f"    ⚡ Turnstile quick-interact (submit-first)")
+        # ─── Quick Turnstile (non-blocking) ───
+        token = await _try_solve_turnstile(page, quick=True)
+        if token:
+            print(f"    ✅ Turnstile solved: {token[:20]}...")
+        else:
+            print(f"    ⚡ Turnstile quick-interact (submit-first)")
 
     # ─── Submit Form ───
     error = await _submit_form(page)

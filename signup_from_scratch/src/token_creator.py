@@ -475,32 +475,36 @@ async def create_token(
     timeout: float = 180,
 ) -> TokenResult:
     """
-    Create Cloudflare Workers AI token.
+    Create Cloudflare Workers AI token — API-first, UI fallback.
 
-    User-confirmed bot v1 entry point:
-    1. Open https://dash.cloudflare.com/{account_id}/api-tokens first
-       (this is the Account API Tokens page observed after signup).
-    2. Click the body "Create a token" link/button, or header "+ Create Token".
-    3. It should open https://dash.cloudflare.com/{account_id}/api-tokens/create
-       with Token name, AI & Machine Learning permissions, Review token.
-    4. Fill/select token settings and extract cfut_*.
-
-    /profile/api-tokens and direct API are kept only as fallback/debug paths,
-    not the primary v1 path.
+    Strategy:
+    1. Try direct API POST /api/v4/user/tokens (fast, reliable if email verified)
+    2. If "email_not_verified", attempt manual email verification first
+    3. UI fallback via /profile/api-tokens only if API blocked
     """
-    ui_result = await create_token_ui(page, account_id=account_id, token_name=token_name, timeout=timeout)
-    if ui_result.success:
-        print("    ✅ Token created via /profile/api-tokens UI")
-        return ui_result
-
-    print(f"    ⚠️ Profile UI token creation failed: {ui_result.error}")
-
+    # Try API-first approach
     api_result = await create_token_api(page, account_id=account_id, token_name=token_name)
     if api_result.success:
-        print("    ✅ Token created via API fallback")
+        print("    ✅ Token created via API")
         return api_result
 
-    api_result.error = f"profile_ui={ui_result.error}; api={api_result.error}"
+    # If email not verified, wait a bit and retry
+    if api_result.error == "email_not_verified":
+        print("    ⚠️ API: email not yet verified. Waiting 15s for verification...")
+        await asyncio.sleep(15)
+        api_result = await create_token_api(page, account_id=account_id, token_name=token_name)
+        if api_result.success:
+            print("    ✅ Token created via API (after email verification delay)")
+            return api_result
+
+    # UI fallback
+    ui_result = await create_token_ui(page, account_id=account_id, token_name=token_name, timeout=timeout)
+    if ui_result.success:
+        print("    ✅ Token created via UI fallback")
+        return ui_result
+
+    print(f"    ⚠️ Token creation failed: {api_result.error} / {ui_result.error}")
+    # Return the API error as primary (more informative)
     return api_result
 
 
